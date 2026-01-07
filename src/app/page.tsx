@@ -1,65 +1,327 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useState, useRef, useCallback, ChangeEvent, FormEvent } from 'react';
+import { Upload, Link, Send, X, CheckCircle, AlertCircle, Loader2, File as FileIcon } from 'lucide-react';
+import * as XLSX from 'xlsx';
+import { cn } from '../../lib/utils';
+import { supabase } from '../../lib/supabaseClient';
+
+// Added rawFile to store the actual browser File object
+interface UploadedFile {
+  name: string;
+  size: number;
+  type: string;
+  rawFile: File; 
+}
+
+interface FormState {
+  file: UploadedFile | null;
+  webhookUrl: string;
+  isLoading: boolean;
+  isSubmitted: boolean;
+  errors: {
+    file?: string;
+    webhookUrl?: string;
+    submit?: string;
+  };
+  success: string;
+}
+
+export default function FileUploadPage() {
+  const [formState, setFormState] = useState<FormState>({
+    file: null,
+    webhookUrl: 'https://parrot-giving-daily.ngrok-free.app/webhook-test/upload-excel',
+    isLoading: false,
+    isSubmitted: false,
+    errors: {},
+    success: '',
+  });
+  
+  const [isDragging, setIsDragging] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const validateWebhookUrl = (url: string): boolean => {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.protocol === 'http:' || urlObj.protocol === 'https:';
+    } catch {
+      return false;
+    }
+  };
+
+  const validateFile = (file: File): string | null => {
+    const acceptedTypes = [
+      'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+      'application/pdf', 'text/plain', 'application/json',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
+      'application/vnd.ms-excel', // .xls
+      'application/zip', 'application/x-zip-compressed'
+    ];
+    
+    const maxSize = 10 * 1024 * 1024;
+    
+    // Check type or extension for Excel files
+    const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
+    
+    if (!acceptedTypes.includes(file.type) && !isExcel) {
+      return 'File type not supported. Please upload an image, PDF, Excel, JSON, or ZIP file.';
+    }
+    
+    if (file.size > maxSize) {
+      return 'File size exceeds 10MB limit.';
+    }
+    
+    return null;
+  };
+
+  const handleFileSelection = (file: File) => {
+    const validationError = validateFile(file);
+    if (validationError) {
+      setFormState(prev => ({
+        ...prev,
+        errors: { ...prev.errors, file: validationError }
+      }));
+      return;
+    }
+    
+    setFormState(prev => ({
+      ...prev,
+      file: {
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        rawFile: file 
+      },
+      errors: { ...prev.errors, file: undefined }
+    }));
+  };
+
+  const handleFileChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) handleFileSelection(file);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFileSelection(file);
+  }, []);
+
+  const handleWebhookUrlChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    const url = e.target.value;
+    setFormState(prev => ({
+      ...prev,
+      webhookUrl: url,
+      errors: { ...prev.errors, webhookUrl: undefined }
+    }));
+  }, []);
+
+  const removeFile = useCallback(() => {
+    setFormState(prev => ({
+      ...prev,
+      file: null,
+      errors: { ...prev.errors, file: undefined }
+    }));
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }, []);
+
+  const formatFileSize = (bytes: number): string => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  };
+
+  const handleSubmit = useCallback(async (e: FormEvent) => {
+    e.preventDefault();
+    
+    const errors: FormState['errors'] = {};
+    if (!formState.file) errors.file = 'Please select a file to upload';
+    if (!formState.webhookUrl) {
+      errors.webhookUrl = 'Please enter a webhook URL';
+    } else if (!validateWebhookUrl(formState.webhookUrl)) {
+      errors.webhookUrl = 'Please enter a valid HTTP or HTTPS URL';
+    }
+    
+    if (Object.keys(errors).length > 0) {
+      setFormState(prev => ({ ...prev, errors }));
+      return;
+    }
+    
+    setFormState(prev => ({ ...prev, isLoading: true, errors: {}, success: '' }));
+    
+    try {
+      const file = formState.file!.rawFile;
+      const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
+
+      if (isExcel) {
+        // 1. Extract Data from Excel
+        const buffer = await file.arrayBuffer();
+        const workbook = XLSX.read(buffer, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+        if (jsonData.length === 0) throw new Error("Excel file is empty");
+console.log(jsonData);
+        // 2. Insert into Supabase in chunks of 100
+        const chunkSize = 100;
+        for (let i = 0; i < jsonData.length; i += chunkSize) {
+          const chunk = jsonData.slice(i, i + chunkSize);
+          const { error: supaError } = await supabase
+            .from('excel_data') // <--- APNE TABLE KA NAAM YAHAN LIKHEIN
+            .insert(chunk);
+          
+          if (supaError) throw supaError;
+        }
+      }
+
+      // 3. Optional: Trigger Webhook after successful DB insert
+      // await fetch(formState.webhookUrl, {
+      //   method: 'POST',
+      //   headers: { 'Content-Type': 'application/json' },
+      //   body: JSON.stringify({ 
+      //     event: "file_processed", 
+      //     fileName: formState.file?.name,
+      //     rows_processed: isExcel ? "Multiple" : 1 
+      //   })
+      // });
+
+      setFormState(prev => ({
+        ...prev,
+        isLoading: false,
+        isSubmitted: true,
+        success: isExcel ? 'Excel data extracted and saved to Supabase!' : 'File submitted successfully!'
+      }));
+      
+      setTimeout(() => {
+        setFormState({
+          file: null, webhookUrl: '', isLoading: false, isSubmitted: false, errors: {}, success: ''
+        });
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }, 3000);
+
+    } catch (error: any) {
+      setFormState(prev => ({
+        ...prev,
+        isLoading: false,
+        errors: { submit: error.message || 'Failed to process file. Please check table names and columns.' }
+      }));
+    }
+  }, [formState.file, formState.webhookUrl]);
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 flex items-center justify-center p-4 relative overflow-hidden">
+      <div className="absolute inset-0 opacity-20">
+        <div className="absolute top-0 left-0 w-96 h-96 bg-purple-700 rounded-full filter blur-3xl"></div>
+        <div className="absolute bottom-0 right-0 w-96 h-96 bg-indigo-700 rounded-full filter blur-3xl"></div>
+      </div>
+      
+      <div className="w-full max-w-2xl relative z-10 animate-fadeIn">
+        <div className="bg-white/10 backdrop-blur-lg rounded-2xl shadow-2xl border border-white/20 p-8 md:p-10">
+          <h1 className="text-3xl md:text-4xl font-bold text-white mb-2 text-center">File Upload Portal</h1>
+          <p className="text-slate-300 text-center mb-8">Upload Excel to Supabase & Notify Webhook</p>
+          
+          <form onSubmit={handleSubmit} className="space-y-6">
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">Upload File</label>
+              <div
+                className={cn(
+                  "relative border-2 border-dashed rounded-xl p-6 md:p-8 transition-all duration-300 cursor-pointer",
+                  isDragging ? "border-indigo-400 bg-indigo-500/10" : 
+                  formState.file ? "border-green-400 bg-green-500/10" : 
+                  "border-slate-600 hover:border-slate-500 hover:bg-slate-800/30"
+                )}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileChange}
+                  accept="image/*,.pdf,.txt,.json,.zip,.xlsx,.xls"
+                />
+                
+                {formState.file ? (
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      <div className="bg-green-500/20 p-2 rounded-lg">
+                        <FileIcon className="h-6 w-6 text-green-400" />
+                      </div>
+                      <div>
+                        <p className="text-white font-medium truncate max-w-[200px] md:max-w-md">{formState.file.name}</p>
+                        <p className="text-slate-400 text-sm">{formatFileSize(formState.file.size)}</p>
+                      </div>
+                    </div>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); removeFile(); }} className="text-slate-400 hover:text-red-400">
+                      <X className="h-5 w-5" />
+                    </button>
+                  </div>
+                ) : (
+                  <div className="text-center">
+                    <div className={cn("mx-auto h-12 w-12 rounded-full flex items-center justify-center mb-4", isDragging ? "bg-indigo-500/20 animate-pulse" : "bg-slate-700/50")}>
+                      <Upload className="h-6 w-6 text-slate-300" />
+                    </div>
+                    <p className="text-white font-medium mb-1">Drag & drop your file here</p>
+                    <p className="text-slate-400 text-sm">Supports: Images, PDF, Excel, JSON (Max 10MB)</p>
+                  </div>
+                )}
+              </div>
+              {formState.errors.file && <div className="flex items-center mt-2 text-red-400 text-sm"><AlertCircle className="h-4 w-4 mr-1" />{formState.errors.file}</div>}
+            </div>
+            
+            <div>
+              <label htmlFor="webhook-url" className="block text-sm font-medium text-slate-300 mb-2">Webhook URL (Notify n8n)</label>
+              <div className="relative">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none"><Link className="h-5 w-5 text-slate-400" /></div>
+                <input
+                  id="webhook-url"
+                  type="text"
+                  className={cn("w-full pl-10 pr-3 py-3 bg-slate-800/50 border rounded-lg text-white focus:outline-none focus:ring-2", formState.errors.webhookUrl ? "border-red-500 focus:ring-red-500/50" : "border-slate-600 focus:border-indigo-500 focus:ring-indigo-500/50")}
+                  placeholder="https://n8n.your-instance.com/webhook/..."
+                  value={formState.webhookUrl}
+                  onChange={handleWebhookUrlChange}
+                  disabled={formState.isLoading}
+                />
+              </div>
+              {formState.errors.webhookUrl && <div className="flex items-center mt-2 text-red-400 text-sm"><AlertCircle className="h-4 w-4 mr-1" />{formState.errors.webhookUrl}</div>}
+            </div>
+            
+            <button
+              type="submit"
+              disabled={formState.isLoading || formState.isSubmitted}
+              className={cn("w-full py-3 px-4 rounded-lg font-medium transition-all flex items-center justify-center", formState.isLoading || formState.isSubmitted ? "bg-slate-700 cursor-not-allowed" : "bg-gradient-to-r from-indigo-600 to-purple-600 hover:scale-[1.02] text-white")}
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+              {formState.isLoading ? <><Loader2 className="animate-spin h-5 w-5 mr-2" /> Processing Data...</> : 
+               formState.isSubmitted ? <><CheckCircle className="h-5 w-5 mr-2" /> Done!</> : 
+               <><Send className="h-5 w-5 mr-2" /> Start Processing</>}
+            </button>
+
+            {formState.success && <div className="p-3 bg-green-500/20 border border-green-500/30 rounded-lg text-green-400 text-center animate-fadeIn">{formState.success}</div>}
+            {formState.errors.submit && <div className="p-3 bg-red-500/20 border border-red-500/30 rounded-lg text-red-400 text-center animate-fadeIn">{formState.errors.submit}</div>}
+          </form>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+      </div>
+
+      <style jsx>{`
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fadeIn { animation: fadeIn 0.5s ease-out; }
+      `}</style>
     </div>
   );
 }
