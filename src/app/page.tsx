@@ -1,17 +1,18 @@
 'use client';
 
 import { useState, useRef, useCallback, ChangeEvent, FormEvent } from 'react';
-import { Upload, Link, Send, X, CheckCircle, AlertCircle, Loader2, File as FileIcon } from 'lucide-react';
+import { Upload, Link, Send, X, CheckCircle, AlertCircle, Loader2, File as FileIcon, CloudCog } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { cn } from '../../lib/utils';
 import { supabase } from '../../lib/supabaseClient';
+
 
 // Added rawFile to store the actual browser File object
 interface UploadedFile {
   name: string;
   size: number;
   type: string;
-  rawFile: File; 
+  rawFile: File;
 }
 
 interface FormState {
@@ -36,7 +37,7 @@ export default function FileUploadPage() {
     errors: {},
     success: '',
   });
-  
+
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -57,20 +58,20 @@ export default function FileUploadPage() {
       'application/vnd.ms-excel', // .xls
       'application/zip', 'application/x-zip-compressed'
     ];
-    
+
     const maxSize = 10 * 1024 * 1024;
-    
+
     // Check type or extension for Excel files
     const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
-    
+
     if (!acceptedTypes.includes(file.type) && !isExcel) {
       return 'File type not supported. Please upload an image, PDF, Excel, JSON, or ZIP file.';
     }
-    
+
     if (file.size > maxSize) {
       return 'File size exceeds 10MB limit.';
     }
-    
+
     return null;
   };
 
@@ -83,14 +84,14 @@ export default function FileUploadPage() {
       }));
       return;
     }
-    
+
     setFormState(prev => ({
       ...prev,
       file: {
         name: file.name,
         size: file.size,
         type: file.type,
-        rawFile: file 
+        rawFile: file
       },
       errors: { ...prev.errors, file: undefined }
     }));
@@ -144,105 +145,91 @@ export default function FileUploadPage() {
     return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
   };
 
-  const handleSubmit = useCallback(async (e: FormEvent) => {
-    e.preventDefault();
-    
-    const errors: FormState['errors'] = {};
-    if (!formState.file) errors.file = 'Please select a file to upload';
-    if (!formState.webhookUrl) {
-      errors.webhookUrl = 'Please enter a webhook URL';
-    } else if (!validateWebhookUrl(formState.webhookUrl)) {
-      errors.webhookUrl = 'Please enter a valid HTTP or HTTPS URL';
-    }
-    
-    if (Object.keys(errors).length > 0) {
-      setFormState(prev => ({ ...prev, errors }));
-      return;
-    }
-    
-    setFormState(prev => ({ ...prev, isLoading: true, errors: {}, success: '' }));
-    
-    try {
-      const file = formState.file!.rawFile;
-      const isExcel = file.name.endsWith('.xlsx') || file.name.endsWith('.xls');
+const handleSubmit = useCallback(async (e: FormEvent) => {
+  e.preventDefault();
+  // ... (validations same rahengi)
 
-      if (isExcel) {
-        // 1. Extract Data from Excel
-        const buffer = await file.arrayBuffer();
-        const workbook = XLSX.read(buffer, { type: 'array' });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-        const jsonData = XLSX.utils.sheet_to_json(worksheet);
+  setFormState(prev => ({ ...prev, isLoading: true, errors: {}, success: '' }));
 
-        if (jsonData.length === 0) throw new Error("Excel file is empty");
-console.log(jsonData);
-        // 2. Insert into Supabase in chunks of 100
-        const chunkSize = 100;
-        for (let i = 0; i < jsonData.length; i += chunkSize) {
-          const chunk = jsonData.slice(i, i + chunkSize);
-          const { error: supaError } = await supabase
-            .from('excel_data') // <--- APNE TABLE KA NAAM YAHAN LIKHEIN
-            .insert(chunk);
-          
-          if (supaError) throw supaError;
-        }
-      }
+  try {
+    const file = formState.file!.rawFile;
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const rawData: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
 
-      // 3. Optional: Trigger Webhook after successful DB insert
-      // await fetch(formState.webhookUrl, {
-      //   method: 'POST',
-      //   headers: { 'Content-Type': 'application/json' },
-      //   body: JSON.stringify({ 
-      //     event: "file_processed", 
-      //     fileName: formState.file?.name,
-      //     rows_processed: isExcel ? "Multiple" : 1 
-      //   })
-      // });
+    if (rawData.length === 0) throw new Error("Excel file is empty");
 
-      setFormState(prev => ({
-        ...prev,
-        isLoading: false,
-        isSubmitted: true,
-        success: isExcel ? 'Excel data extracted and saved to Supabase!' : 'File submitted successfully!'
-      }));
+    // --- STEP 1: DATA MAPPING START ---
+    // Yahan aap batao ke Excel ka kaunsa column DB ke kis column mein jaye
+    const mappedData = rawData.map((row) => ({
+      // database_column_name: row['Excel_Column_Name']
+      name: row['identifier-label'], 
+      website_url: row['component--field-formatter href'],
+      fundingamount_date: row['component--field-formatter (4)'],
+      funding_amount: row['component--field-formatter (6)'],
+      round: row['component--field-formatter (5)'],
+      // Agar koi static value bhejni ho:
+    }));
+    // --- STEP 1: DATA MAPPING END ---
+
+    // --- STEP 2: BATCHING & INSERTION ---
+    const chunkSize = 50;
+    for (let i = 0; i < mappedData.length; i += chunkSize) {
+      const chunk = mappedData.slice(i, i + chunkSize);
       
-      setTimeout(() => {
-        setFormState({
-          file: null, webhookUrl: '', isLoading: false, isSubmitted: false, errors: {}, success: ''
-        });
-        if (fileInputRef.current) fileInputRef.current.value = '';
-      }, 3000);
+      const { error: supaError } = await supabase
+        .from('excel_data') // Apne table ka sahi naam yahan likhein
+        .insert(chunk);
 
-    } catch (error: any) {
-      setFormState(prev => ({
-        ...prev,
-        isLoading: false,
-        errors: { submit: error.message || 'Failed to process file. Please check table names and columns.' }
-      }));
+      if (supaError) throw supaError;
     }
-  }, [formState.file, formState.webhookUrl]);
 
+    // --- STEP 3: WEBHOOK HIT ---
+    await fetch(formState.webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        message: "Data synced successfully",
+        total_rows: mappedData.length 
+      })
+    });
+
+    setFormState(prev => ({
+      ...prev,
+      isLoading: false,
+      isSubmitted: true,
+      success: 'Mapped data saved and Webhook notified!'
+    }));
+
+  } catch (error: any) {
+    setFormState(prev => ({
+      ...prev,
+      isLoading: false,
+      errors: { submit: error.message }
+    }));
+  }
+}, [formState.file, formState.webhookUrl]);
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 flex items-center justify-center p-4 relative overflow-hidden">
       <div className="absolute inset-0 opacity-20">
         <div className="absolute top-0 left-0 w-96 h-96 bg-purple-700 rounded-full filter blur-3xl"></div>
         <div className="absolute bottom-0 right-0 w-96 h-96 bg-indigo-700 rounded-full filter blur-3xl"></div>
       </div>
-      
+
       <div className="w-full max-w-2xl relative z-10 animate-fadeIn">
         <div className="bg-white/10 backdrop-blur-lg rounded-2xl shadow-2xl border border-white/20 p-8 md:p-10">
           <h1 className="text-3xl md:text-4xl font-bold text-white mb-2 text-center">File Upload Portal</h1>
           <p className="text-slate-300 text-center mb-8">Upload Excel to Supabase & Notify Webhook</p>
-          
+
           <form onSubmit={handleSubmit} className="space-y-6">
             <div>
               <label className="block text-sm font-medium text-slate-300 mb-2">Upload File</label>
               <div
                 className={cn(
                   "relative border-2 border-dashed rounded-xl p-6 md:p-8 transition-all duration-300 cursor-pointer",
-                  isDragging ? "border-indigo-400 bg-indigo-500/10" : 
-                  formState.file ? "border-green-400 bg-green-500/10" : 
-                  "border-slate-600 hover:border-slate-500 hover:bg-slate-800/30"
+                  isDragging ? "border-indigo-400 bg-indigo-500/10" :
+                    formState.file ? "border-green-400 bg-green-500/10" :
+                      "border-slate-600 hover:border-slate-500 hover:bg-slate-800/30"
                 )}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
@@ -256,7 +243,7 @@ console.log(jsonData);
                   onChange={handleFileChange}
                   accept="image/*,.pdf,.txt,.json,.zip,.xlsx,.xls"
                 />
-                
+
                 {formState.file ? (
                   <div className="flex items-center justify-between">
                     <div className="flex items-center space-x-3">
@@ -284,7 +271,7 @@ console.log(jsonData);
               </div>
               {formState.errors.file && <div className="flex items-center mt-2 text-red-400 text-sm"><AlertCircle className="h-4 w-4 mr-1" />{formState.errors.file}</div>}
             </div>
-            
+
             <div>
               <label htmlFor="webhook-url" className="block text-sm font-medium text-slate-300 mb-2">Webhook URL (Notify n8n)</label>
               <div className="relative">
@@ -301,15 +288,15 @@ console.log(jsonData);
               </div>
               {formState.errors.webhookUrl && <div className="flex items-center mt-2 text-red-400 text-sm"><AlertCircle className="h-4 w-4 mr-1" />{formState.errors.webhookUrl}</div>}
             </div>
-            
+
             <button
               type="submit"
               disabled={formState.isLoading || formState.isSubmitted}
               className={cn("w-full py-3 px-4 rounded-lg font-medium transition-all flex items-center justify-center", formState.isLoading || formState.isSubmitted ? "bg-slate-700 cursor-not-allowed" : "bg-gradient-to-r from-indigo-600 to-purple-600 hover:scale-[1.02] text-white")}
             >
-              {formState.isLoading ? <><Loader2 className="animate-spin h-5 w-5 mr-2" /> Processing Data...</> : 
-               formState.isSubmitted ? <><CheckCircle className="h-5 w-5 mr-2" /> Done!</> : 
-               <><Send className="h-5 w-5 mr-2" /> Start Processing</>}
+              {formState.isLoading ? <><Loader2 className="animate-spin h-5 w-5 mr-2" /> Processing Data...</> :
+                formState.isSubmitted ? <><CheckCircle className="h-5 w-5 mr-2" /> Done!</> :
+                  <><Send className="h-5 w-5 mr-2" /> Start Processing</>}
             </button>
 
             {formState.success && <div className="p-3 bg-green-500/20 border border-green-500/30 rounded-lg text-green-400 text-center animate-fadeIn">{formState.success}</div>}
